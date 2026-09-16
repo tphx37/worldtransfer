@@ -1,0 +1,9 @@
+{
+  "required": true,
+  "package": "com.worldtransfer.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": ["ScreenAccessor"],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
