@@ -6,9 +6,13 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.PauseScreen;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.world.level.storage.LevelResource;
 
 import java.nio.file.Files;
@@ -35,35 +39,63 @@ public class WorldTransferClient implements ClientModInitializer {
         });
 
         ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> {
-            if (!(screen instanceof PauseScreen)) {
+            if (!(screen instanceof PauseScreen pauseScreen) || !pauseScreen.showsPauseMenu()) {
                 return;
             }
-            Button transferButton = Button.builder(Component.literal("Transfer world ownership"),
-                    button -> client.setScreenAndShow(new TransferScreen(screen)))
-                .bounds(scaledWidth / 2 - 100, scaledHeight / 4 + 150, 200, 20)
-                .build();
-            transferButton.active = client.isLocalServer();
-            ((ScreenAccessor) screen).worldtransfer$addRenderableWidget(transferButton);
-
-            if (IncomingTransfer.current() != null) {
-                Button incoming = Button.builder(Component.literal("Incoming world transfer"),
-                        button -> client.setScreenAndShow(new IncomingTransferScreen(screen)))
-                    .bounds(scaledWidth / 2 - 100, scaledHeight / 4 + 174, 200, 20)
-                    .build();
-                ((ScreenAccessor) screen).worldtransfer$addRenderableWidget(incoming);
+            // Anchor right next to "Save and Quit to Title" so it reads as one of the row's own
+            // buttons instead of a whole extra menu row. Falls back to a fixed guess if that button
+            // cannot be found (e.g. a future game update changes the pause menu layout).
+            int x = scaledWidth / 2 + 106;
+            int y = scaledHeight / 4 + 150 + 66;
+            AbstractWidget disconnect = findDisconnectButton(pauseScreen, client.isLocalServer());
+            if (disconnect != null) {
+                x = disconnect.getX() + disconnect.getWidth() + 4;
+                y = disconnect.getY();
             }
+            Button transferButton = Button.builder(Component.literal("WT"),
+                    button -> client.setScreenAndShow(new TransferScreen(screen)))
+                .bounds(x, y, 20, 20)
+                .tooltip(Tooltip.create(Component.literal("Transfer world ownership")))
+                .build();
+            ((ScreenAccessor) screen).worldtransfer$addRenderableWidget(transferButton);
         });
     }
 
-    /** Pops the offer up as soon as it lands, unless the player is busy in another screen. */
+    /**
+     * Finds "Save and Quit to Title" (or "Disconnect", in a joined game) by its label rather than by
+     * position, since {@code PauseScreen} lays its grid out and centers it after init and doesn't
+     * expose the button directly.
+     */
+    private static AbstractWidget findDisconnectButton(Screen screen, boolean isLocalServer) {
+        Component label = CommonComponents.disconnectButtonLabel(isLocalServer);
+        for (var child : screen.children()) {
+            if (child instanceof AbstractWidget widget && label.equals(widget.getMessage())) {
+                return widget;
+            }
+        }
+        return null;
+    }
+
+    private static IncomingTransfer offerScreenShownFor;
+
+    /**
+     * Pops the offer up once, as soon as it lands. This runs every client tick, so it must not just
+     * re-show the screen unconditionally - that replaced it with a fresh instance 20 times a second
+     * for as long as the offer sat unanswered, which is what was flickering. Tracking the specific
+     * IncomingTransfer instance (not just its state) means the player can close or navigate away from
+     * the prompt without it fighting back, while a genuinely new offer still pops up automatically.
+     */
     private static void openOfferScreen(Minecraft client) {
         IncomingTransfer transfer = IncomingTransfer.current();
         if (transfer == null || transfer.state() != IncomingTransfer.State.OFFERED) {
+            offerScreenShownFor = null;
             return;
         }
-        if (client.player != null) {
-            client.setScreenAndShow(new IncomingTransferScreen(null));
+        if (transfer == offerScreenShownFor || client.player == null) {
+            return;
         }
+        offerScreenShownFor = transfer;
+        client.setScreenAndShow(new IncomingTransferScreen(client.gui.screen()));
     }
 
     /**

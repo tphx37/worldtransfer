@@ -16,6 +16,7 @@ public class IncomingTransferScreen extends Screen {
     private final Screen parent;
     private IncomingTransfer.State lastState;
     private String lastStatus = "";
+    private long nextRefreshAllowed;
 
     public IncomingTransferScreen(Screen parent) {
         super(Component.literal("Incoming world transfer"));
@@ -85,7 +86,12 @@ public class IncomingTransferScreen extends Screen {
         IncomingTransfer transfer = IncomingTransfer.current();
         IncomingTransfer.State state = transfer == null ? null : transfer.state();
         String status = transfer == null ? "" : transfer.status();
-        if (state != lastState || !status.equals(lastStatus)) {
+        if (state != lastState) {
+            refresh(); // a real state change (e.g. RECEIVING -> APPLYING) always shows right away
+        } else if (!status.equals(lastStatus) && System.currentTimeMillis() >= nextRefreshAllowed) {
+            // The byte-count in status updates on every incoming packet - tens of times a second
+            // while a bundle streams in. Rebuilding every widget that often is what flickered;
+            // capping it to ~5/sec keeps the counter live without tearing the screen down constantly.
             refresh();
         }
     }
@@ -93,6 +99,7 @@ public class IncomingTransferScreen extends Screen {
     private void refresh() {
         clearWidgets();
         init();
+        nextRefreshAllowed = System.currentTimeMillis() + 200;
     }
 
     private void label(String text, int y) {

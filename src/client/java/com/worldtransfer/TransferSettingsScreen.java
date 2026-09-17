@@ -17,22 +17,35 @@ public class TransferSettingsScreen extends Screen {
 
     @Override
     protected void init() {
-        int y = 45;
+        int y = 40;
         addToggle("Player data: " + onOff(settings.includePlayerData), y,
             () -> settings.includePlayerData = !settings.includePlayerData);
-        y += 27;
+        y += 24;
         addToggle("Advancements: " + onOff(settings.includeAdvancements), y,
             () -> settings.includeAdvancements = !settings.includeAdvancements);
-        y += 27;
+        y += 24;
         addToggle("Entities: " + onOff(settings.includeEntities), y,
             () -> settings.includeEntities = !settings.includeEntities);
-        y += 27;
+        y += 24;
         addToggle("World data: " + onOff(settings.includeWorldData), y,
             () -> settings.includeWorldData = !settings.includeWorldData);
-        y += 35;
+        y += 32;
+
+        addToggle("Carry over cheats: " + onOff(settings.carryCheats), y,
+            () -> settings.carryCheats = !settings.carryCheats);
+        y += 20;
+        label(settings.carryCheats
+            ? "Guests of the new host will be able to run commands"
+            : "Safe: the copy is made with cheats off", y);
+        y += 28;
+
         addRenderableWidget(Button.builder(
-                Component.literal("Save to: " + (settings.saveToDesktop ? "Desktop" : "Minecraft folder")),
-                button -> settings.saveToDesktop = !settings.saveToDesktop)
+                Component.literal("Save ZIP to: " + (settings.saveToDesktop ? "Desktop" : "Minecraft folder")),
+                button -> {
+                    settings.saveToDesktop = !settings.saveToDesktop;
+                    clearWidgets();
+                    init();
+                })
             .bounds(this.width / 2 - 125, y, 250, 20)
             .build());
 
@@ -50,6 +63,14 @@ public class TransferSettingsScreen extends Screen {
             })
             .bounds(this.width / 2 - 125, y, 250, 20)
             .build());
+    }
+
+    private void label(String text, int y) {
+        Button label = Button.builder(Component.literal(text), button -> { })
+            .bounds(this.width / 2 - 145, y, 290, 20)
+            .build();
+        label.active = false;
+        addRenderableWidget(label);
     }
 
     private static String onOff(boolean value) {

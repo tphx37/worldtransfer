@@ -252,7 +252,15 @@ public final class IncomingTransfer {
         try {
             Path saves = Minecraft.getInstance().gameDirectory.toPath().resolve("saves");
             Files.createDirectories(saves);
-            destination = uniqueFolder(saves, TransferData.sanitize(index.get("world", "TransferredWorld")));
+            if (baseWorld != null) {
+                // Update the copy we already have, in place. Its folder name already matches this
+                // world (that's how findBaseWorld matched it), so handing uniqueFolder() that same
+                // name would only ever find it taken and tack on "-2" - every single time, not just
+                // the first collision.
+                destination = baseWorld;
+            } else {
+                destination = uniqueFolder(saves, TransferData.sanitize(index.get("world", "TransferredWorld")));
+            }
 
             // Extract everything that arrived, then fill the rest in from the local copy.
             status = "Unpacking...";
@@ -272,7 +280,9 @@ public final class IncomingTransfer {
                 }
             }
 
-            if (baseWorld != null) {
+            if (baseWorld != null && !baseWorld.equals(destination)) {
+                // Currently dead in practice since destination now equals baseWorld whenever it's
+                // set (see above), but kept as a guard in case that ever changes again.
                 status = "Reusing unchanged files...";
                 for (TransferData.FileEntry entry : index.entries()) {
                     Path out = safeResolve(destination, entry.path());

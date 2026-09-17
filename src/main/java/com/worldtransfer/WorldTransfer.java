@@ -1,10 +1,13 @@
 package com.worldtransfer;
 
-import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.context.CommandContext;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.SharedConstants;
+import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.EntityArgument;
 import net.minecraft.core.UUIDUtil;
@@ -14,6 +17,7 @@ import net.minecraft.nbt.NbtIo;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.players.NameAndId;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.level.storage.TagValueInput;
@@ -23,110 +27,317 @@ import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 /**
- * Hands a LAN world to another player.
+ * Server half of World Transfer.
  *
- * <p>The important detail for Minecraft 26.x: the "who is the host" information in a save is
- * {@code level.dat -> Data.singleplayer_uuid}. When a world is opened in singleplayer the game asks
- * {@code PlayerList.loadPlayerData}, which - for the owner of the save - ignores the joining player's own
- * UUID and loads {@code playerdata/<singleplayer_uuid>.dat}. The legacy {@code Data.Player} tag is no longer
- * read at all. So the whole transfer is one change: point {@code singleplayer_uuid} at the new host and make
- * sure that player's own .dat file is in the ZIP. Everybody else keeps their own UUID-named file.</p>
+ * <p>Two delivery routes share one export pipeline:</p>
+ * <ul>
+ *   <li><b>ZIP</b> - write every file of the world into an archive the host hands over manually.</li>
+ *   <li><b>Direct</b> - send the receiver an index of the world, let them say which files they are
+ *       missing, and stream only those over the LAN connection that already exists.</li>
+ * </ul>
+ *
+ * <p>Both produce a save whose {@code level.dat -> Data.singleplayer_uuid} points at the new host,
+ * which is the field that actually moves ownership. See the README.</p>
  */
 public class WorldTransfer implements ModInitializer {
     public static final String MOD_ID = "worldtransfer";
-    public static final String MARKER_FILE = "world-transfer.json";
-    public static final String SNAPSHOT_DIR = "world-transfer";
+    public static final String MOD_VERSION = "0.4.1";
 
     private static final DateTimeFormatter FILE_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
-    private static final Pattern PARTICIPANT_NAMES = Pattern.compile("\"participants\"\\s*:\\s*\\[([^]]*)]", Pattern.DOTALL);
-    private static final Pattern QUOTED = Pattern.compile("\"([^\"]+)\"");
     private static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
-    /** Players already handled by the name fallback in this session. */
+    private static final Map<UUID, Session> SESSIONS = new HashMap<>();
     private static final Set<UUID> FALLBACK_DONE = new HashSet<>();
-    /** Participant names seen online since this world was opened. */
     private static final Set<String> SEEN_NAMES = new HashSet<>();
 
-    private record Snapshot(String name, CompoundTag data) {
+    /** Everything needed to produce a transferred copy of the world, computed once up front. */
+    private static final class Plan {
+        UUID transferId;
+        String worldId;
+        Path worldRoot;
+        String worldFolder;
+        String gameVersion;
+        int worldVersion;
+        /** Files whose content differs from disk: level.dat, player data, metadata. */
+        final Map<String, byte[]> overrides = new LinkedHashMap<>();
+        final TransferData.Index index = new TransferData.Index();
     }
+
+    /** A direct transfer in flight, ticked forward on the server thread. */
+    private static final class Session {
+        UUID transferId;
+        UUID targetUuid;
+        String targetName;
+        Plan plan;
+        String state = "index";
+        int outSeq;
+        byte[] indexBytes;
+        int indexOffset;
+        final ByteArrayOutputStream needBuffer = new ByteArrayOutputStream();
+        Path bundle;
+        InputStream bundleStream;
+        long bundleSize;
+        long bundleSent;
+    }
+
+    // ------------------------------------------------------------------
+    // Lifecycle
+    // ------------------------------------------------------------------
 
     @Override
     public void onInitialize() {
         TransferNet.register();
-        ServerTickEvents.END_SERVER_TICK.register(WorldTransfer::tickNameFallback);
-        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
-            var worldData = Commands.argument("worldData", BoolArgumentType.bool())
-                .executes(context -> prepareTransfer(
-                    context.getSource().getServer(),
-                    EntityArgument.getPlayer(context, "player"),
-                    context.getSource().getPlayer(),
-                    StringArgumentType.getString(context, "destination"),
-                    BoolArgumentType.getBool(context, "playerData"),
-                    BoolArgumentType.getBool(context, "advancements"),
-                    BoolArgumentType.getBool(context, "entities"),
-                    BoolArgumentType.getBool(context, "worldData")));
-            var entities = Commands.argument("entities", BoolArgumentType.bool()).then(worldData);
-            var advancements = Commands.argument("advancements", BoolArgumentType.bool()).then(entities);
-            var playerData = Commands.argument("playerData", BoolArgumentType.bool()).then(advancements);
-            var destination = Commands.argument("destination", StringArgumentType.word()).then(playerData);
-            var player = Commands.argument("player", EntityArgument.player()).then(destination);
-            dispatcher.register(Commands.literal("worldtransfer").then(Commands.literal("prepare").then(player)));
+        ServerPlayNetworking.registerGlobalReceiver(TransferNet.Reply.TYPE,
+            (payload, context) -> handleReply(context.server(), context.player(), payload));
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            tickSessions(server);
+            tickNameFallback(server);
         });
+
+        // One optional, greedy options token instead of a chain of booleans. A chain has to match
+        // argument for argument or brigadier rejects the whole line; this cannot go out of step, and
+        // "/worldtransfer send <player>" on its own always works.
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
+            dispatcher.register(Commands.literal("worldtransfer")
+                .then(Commands.literal("send")
+                    .then(Commands.argument("player", EntityArgument.player())
+                        .executes(context -> startDirect(context, Options.defaults()))
+                        .then(Commands.argument("options", StringArgumentType.greedyString())
+                            .executes(context -> startDirect(context,
+                                Options.parse(StringArgumentType.getString(context, "options")))))))
+                .then(Commands.literal("prepare")
+                    .then(Commands.argument("player", EntityArgument.player())
+                        .executes(context -> exportZip(context, Options.defaults()))
+                        .then(Commands.argument("options", StringArgumentType.greedyString())
+                            .executes(context -> exportZip(context,
+                                Options.parse(StringArgumentType.getString(context, "options")))))))));
+    }
+
+    /**
+     * What to include in a transfer. Parsed from a free-form token list so the command never depends
+     * on argument order or count: unknown tokens are ignored, missing ones keep their default.
+     *
+     * <p>Accepted tokens: {@code playerdata}, {@code advancements}, {@code entities},
+     * {@code worlddata}, {@code cheats}, each with a {@code no} prefix to turn it off, plus
+     * {@code desktop} or {@code minecraft} to choose where a ZIP is written.</p>
+     */
+    public record Options(boolean playerData, boolean advancements, boolean entities, boolean worldData,
+                          boolean carryCheats, boolean toDesktop) {
+        public static Options defaults() {
+            // Cheats default to off: see the permissions note in the README.
+            return new Options(true, true, true, true, false, true);
+        }
+
+        public static Options parse(String text) {
+            boolean playerData = true;
+            boolean advancements = true;
+            boolean entities = true;
+            boolean worldData = true;
+            boolean cheats = false;
+            boolean desktop = true;
+            for (String raw : text.toLowerCase(Locale.ROOT).split("[\\s,;]+")) {
+                boolean on = !raw.startsWith("no");
+                String key = on ? raw : raw.substring(2);
+                switch (key) {
+                    case "playerdata" -> playerData = on;
+                    case "advancements" -> advancements = on;
+                    case "entities" -> entities = on;
+                    case "worlddata" -> worldData = on;
+                    case "cheats", "commands" -> cheats = on;
+                    case "desktop" -> desktop = true;
+                    case "minecraft", "gamedir" -> desktop = false;
+                    default -> {
+                    }
+                }
+            }
+            return new Options(playerData, advancements, entities, worldData, cheats, desktop);
+        }
+    }
+
+    private static int startDirect(CommandContext<CommandSourceStack> context, Options options)
+        throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return startDirect(context.getSource().getServer(), EntityArgument.getPlayer(context, "player"),
+            context.getSource().getPlayer(), options);
+    }
+
+    private static int exportZip(CommandContext<CommandSourceStack> context, Options options)
+        throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return exportZip(context.getSource().getServer(), EntityArgument.getPlayer(context, "player"),
+            context.getSource().getPlayer(), options);
     }
 
     // ------------------------------------------------------------------
-    // Export
+    // Export pipeline, shared by both routes
     // ------------------------------------------------------------------
 
-    private static int prepareTransfer(MinecraftServer server, ServerPlayer target, ServerPlayer source,
-                                       String destination, boolean includePlayerData, boolean includeAdvancements,
-                                       boolean includeEntities, boolean includeWorldData) {
-        Path worldRoot = server.getWorldPath(LevelResource.ROOT);
-        try {
-            // Flush everything to disk first, so the copied chunks/level data match what people just played.
-            server.getPlayerList().saveAll();
-            server.saveEverything(true, true, true);
+    private static Plan buildPlan(MinecraftServer server, ServerPlayer target, ServerPlayer source,
+                                  Options options) throws IOException {
+        server.getPlayerList().saveAll();
+        server.saveEverything(true, true, true);
 
-            Map<UUID, Snapshot> snapshots = new LinkedHashMap<>();
+        boolean includePlayerData = options.playerData();
+        boolean includeAdvancements = options.advancements();
+        boolean includeEntities = options.entities();
+        boolean includeWorldData = options.worldData();
+
+        Plan plan = new Plan();
+        plan.transferId = UUID.randomUUID();
+        // LevelResource.ROOT's id is literally "." - getWorldPath(ROOT) is <saveDir>/. unless
+        // normalized, and getFileName() on that returns "." instead of the real folder name. That
+        // "." was showing up as the world name and, once sanitized, resolving straight to the saves
+        // folder itself - which is why it always looked "taken" and got a "-2" suffix.
+        plan.worldRoot = server.getWorldPath(LevelResource.ROOT).normalize();
+        plan.worldFolder = plan.worldRoot.getFileName().toString();
+        plan.worldId = readOrCreateWorldId(plan.worldRoot);
+
+        // 1. level.dat, rewritten so the chosen player owns the save.
+        CompoundTag level = NbtIo.readCompressed(plan.worldRoot.resolve("level.dat"), NbtAccounter.unlimitedHeap());
+        CompoundTag data = level.getCompoundOrEmpty("Data");
+        plan.gameVersion = data.getCompoundOrEmpty("Version").getStringOr("Name", "unknown");
+        plan.worldVersion = SharedConstants.WORLD_VERSION;
+        data.putIntArray("singleplayer_uuid", UUIDUtil.uuidToIntArray(target.getUUID()));
+        data.remove("Player"); // legacy host slot; unread today, but it must not linger
+        if (!options.carryCheats()) {
+            // Data.allowCommands is what lets guests of the new host's LAN game run commands
+            // (IntegratedServer.getCustomPermissionLevel). Off unless explicitly carried over; the
+            // new host can turn it back on from the world's own options.
+            data.putBoolean("allowCommands", false);
+        }
+        level.put("Data", data);
+        plan.overrides.put("level.dat", toCompressedBytes(level));
+
+        // 2. Live player data for everyone online, under their own UUID and under their name.
+        List<String> participants = new ArrayList<>();
+        if (includePlayerData) {
             for (ServerPlayer online : server.getPlayerList().getPlayers()) {
-                snapshots.put(online.getUUID(),
-                    new Snapshot(online.getGameProfile().name(), serializePlayer(server, online)));
+                String name = online.getGameProfile().name();
+                byte[] bytes = toCompressedBytes(stripUuid(serializePlayer(server, online)));
+                plan.overrides.put("playerdata/" + online.getUUID() + ".dat", bytes);
+                plan.overrides.put(TransferData.PLAYERS_DIR + "/" + TransferData.safeName(name) + ".dat", bytes);
+                participants.add(name);
             }
+        }
 
-            Path archive = createArchive(worldRoot, destination, snapshots, target.getUUID(),
-                target.getGameProfile().name(), source == null ? "server" : source.getGameProfile().name(),
-                includePlayerData, includeAdvancements, includeEntities, includeWorldData);
+        // 3. Marker, ownership history, stable world id.
+        String sourceName = source == null ? "server" : source.getGameProfile().name();
+        plan.overrides.put(TransferData.MARKER_FILE, TransferData.markerJson(
+            plan.transferId.toString(), plan.worldId, target.getGameProfile().name(),
+            target.getUUID().toString(), sourceName, plan.gameVersion, plan.worldVersion,
+            MOD_VERSION, participants).getBytes(StandardCharsets.UTF_8));
+        String history = appendHistory(plan.worldRoot, sourceName, target.getGameProfile().name(),
+            plan.gameVersion, plan.transferId.toString());
+        plan.overrides.put(TransferData.HISTORY_FILE, history.getBytes(StandardCharsets.UTF_8));
+        // Also record it in the world being transferred from, so the sending host's own
+        // "Ownership history" screen has something to show.
+        Files.writeString(plan.worldRoot.resolve(TransferData.HISTORY_FILE), history);
+        plan.overrides.put(TransferData.WORLD_ID_FILE, plan.worldId.getBytes(StandardCharsets.UTF_8));
+
+        // 4. Index: everything on disk that survives the filters, plus the overrides.
+        Map<String, TransferData.FileEntry> entries = new LinkedHashMap<>();
+        try (var files = Files.walk(plan.worldRoot)) {
+            for (Path file : files.filter(Files::isRegularFile).toList()) {
+                String path = plan.worldRoot.relativize(file).toString().replace('\\', '/');
+                if (!shouldInclude(path, options) || plan.overrides.containsKey(path)) {
+                    continue;
+                }
+                entries.put(path, new TransferData.FileEntry(path, Files.size(file), TransferData.sha1(file)));
+            }
+        }
+        for (Map.Entry<String, byte[]> override : plan.overrides.entrySet()) {
+            entries.put(override.getKey(), new TransferData.FileEntry(
+                override.getKey(), override.getValue().length, TransferData.sha1(override.getValue())));
+        }
+        plan.index.entries().addAll(entries.values());
+        plan.index.meta().put("worldId", plan.worldId);
+        plan.index.meta().put("world", plan.worldFolder);
+        plan.index.meta().put("transferId", plan.transferId.toString());
+        plan.index.meta().put("game", plan.gameVersion);
+        plan.index.meta().put("worldVersion", String.valueOf(plan.worldVersion));
+        plan.index.meta().put("mod", MOD_VERSION);
+        plan.index.meta().put("host", sourceName);
+        plan.index.meta().put("target", target.getGameProfile().name());
+        plan.index.meta().put("targetUuid", target.getUUID().toString());
+        return plan;
+    }
+
+    /** Writes the requested paths into a ZIP, taking each file from the override map or from disk. */
+    private static void writeBundle(OutputStream output, Plan plan, List<String> paths, String prefix)
+        throws IOException {
+        try (ZipOutputStream zip = new ZipOutputStream(output)) {
+            for (String path : paths) {
+                byte[] override = plan.overrides.get(path);
+                Path file = plan.worldRoot.resolve(path);
+                if (override == null && !Files.isRegularFile(file)) {
+                    continue; // deleted between indexing and sending
+                }
+                zip.putNextEntry(new ZipEntry(prefix + path));
+                if (override != null) {
+                    zip.write(override);
+                } else {
+                    Files.copy(file, zip);
+                }
+                zip.closeEntry();
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Route 1: ZIP on disk
+    // ------------------------------------------------------------------
+
+    private static int exportZip(MinecraftServer server, ServerPlayer target, ServerPlayer source,
+                                 Options options) {
+        try {
+            Plan plan = buildPlan(server, target, source, options);
+            Path destination = findExportDirectory(plan.worldRoot, options.toDesktop() ? "desktop" : "minecraft");
+            Files.createDirectories(destination);
+            String fileName = "WorldTransfer-" + TransferData.sanitize(target.getGameProfile().name())
+                + "-" + LocalDateTime.now().format(FILE_TIME) + ".zip";
+            Path archive = destination.resolve(fileName);
+            Path temporary = destination.resolve(fileName + ".part");
+
+            List<String> all = new ArrayList<>();
+            for (TransferData.FileEntry entry : plan.index.entries()) {
+                all.add(entry.path());
+            }
+            try (OutputStream output = Files.newOutputStream(temporary)) {
+                writeBundle(output, plan, all, TransferData.sanitize(plan.worldFolder) + "/");
+            }
+            moveInto(temporary, archive);
 
             if (source != null) {
-                source.sendSystemMessage(Component.literal(
-                    "Transfer ZIP created: " + archive.toAbsolutePath() + ". Send it to "
-                        + target.getGameProfile().name() + "; your own world is unchanged."));
+                source.sendSystemMessage(Component.literal("Transfer ZIP created: "
+                    + archive.toAbsolutePath() + " (" + TransferData.humanBytes(Files.size(archive))
+                    + "). Send it to " + target.getGameProfile().name() + "."));
             }
             target.sendSystemMessage(Component.literal(
-                "A transfer ZIP with you as the new host was created. Unzip it into your saves folder and open it."));
-            LOGGER.info("World transfer archive written to {} (new host {})", archive, target.getUUID());
+                "A transfer ZIP naming you as the new host was created. Unzip it into your saves folder."));
             return 1;
         } catch (IOException | RuntimeException exception) {
-            LOGGER.warn("World transfer failed", exception);
+            LOGGER.warn("ZIP export failed", exception);
             if (source != null) {
                 source.sendSystemMessage(Component.literal("World transfer failed: " + exception.getMessage()));
             }
@@ -134,193 +345,207 @@ public class WorldTransfer implements ModInitializer {
         }
     }
 
-    private static Path createArchive(Path worldRoot, String destinationChoice, Map<UUID, Snapshot> snapshots,
-                                      UUID targetUuid, String targetName, String sourceName,
-                                      boolean includePlayerData, boolean includeAdvancements,
-                                      boolean includeEntities, boolean includeWorldData) throws IOException {
-        Path destination = findExportDirectory(worldRoot, destinationChoice);
-        Files.createDirectories(destination);
+    // ------------------------------------------------------------------
+    // Route 2: direct, over the LAN connection
+    // ------------------------------------------------------------------
 
-        String worldFolder = sanitize(worldRoot.getFileName().toString());
-        String fileName = "WorldTransfer-" + sanitize(targetName) + "-"
-            + LocalDateTime.now().format(FILE_TIME) + ".zip";
-        Path archive = destination.resolve(fileName);
-        Path temporary = destination.resolve(fileName + ".part");
-        // Everything lives under one folder inside the ZIP, so unzipping into "saves" produces a real world.
-        String prefix = worldFolder + "/";
-
-        try (OutputStream output = Files.newOutputStream(temporary);
-             ZipOutputStream zip = new ZipOutputStream(output)) {
-
-            try (var files = Files.walk(worldRoot)) {
-                files.filter(Files::isRegularFile).forEach(file -> {
-                    Path relative = worldRoot.relativize(file);
-                    String entryName = relative.toString().replace('\\', '/');
-                    if (!shouldInclude(entryName, includePlayerData, includeAdvancements,
-                        includeEntities, includeWorldData)) {
-                        return;
-                    }
-                    // These two are rewritten below.
-                    if (entryName.equals("level.dat")) {
-                        return;
-                    }
-                    if (includePlayerData && isLivePlayerFile(entryName, snapshots.keySet())) {
-                        return;
-                    }
-                    try {
-                        zip.putNextEntry(new ZipEntry(prefix + entryName));
-                        Files.copy(file, zip);
-                        zip.closeEntry();
-                    } catch (IOException exception) {
-                        throw new ArchiveWriteException(exception);
-                    }
-                });
+    private static int startDirect(MinecraftServer server, ServerPlayer target, ServerPlayer source,
+                                   Options options) {
+        if (!ServerPlayNetworking.canSend(target, TransferNet.Blob.TYPE)) {
+            if (source != null) {
+                source.sendSystemMessage(Component.literal(target.getGameProfile().name()
+                    + " does not have World Transfer installed, so a direct send is not possible."
+                    + " Use the ZIP option instead."));
             }
-
-            // 1. level.dat with the new host recorded as the owner of the save.
-            zip.putNextEntry(new ZipEntry(prefix + "level.dat"));
-            writeCompressedTag(zip, newHostLevelData(worldRoot, targetUuid));
-            zip.closeEntry();
-
-            if (includePlayerData) {
-                // 2. One up-to-date .dat per online player, under that player's own UUID.
-                for (Map.Entry<UUID, Snapshot> entry : snapshots.entrySet()) {
-                    CompoundTag tag = strippedPlayerData(entry.getValue().data());
-                    zip.putNextEntry(new ZipEntry(prefix + "playerdata/" + entry.getKey() + ".dat"));
-                    writeCompressedTag(zip, tag);
-                    zip.closeEntry();
-
-                    // 3. The same data keyed by name, used only if a player's UUID differs in the new session.
-                    zip.putNextEntry(new ZipEntry(prefix + SNAPSHOT_DIR + "/players/"
-                        + sanitize(entry.getValue().name()).toLowerCase(Locale.ROOT) + ".dat"));
-                    writeCompressedTag(zip, tag);
-                    zip.closeEntry();
+            return 0;
+        }
+        for (Session existing : SESSIONS.values()) {
+            if (existing.targetUuid.equals(target.getUUID())) {
+                if (source != null) {
+                    source.sendSystemMessage(Component.literal("A transfer to that player is already running."));
                 }
-
-                zip.putNextEntry(new ZipEntry(prefix + MARKER_FILE));
-                zip.write(markerJson(targetName, targetUuid, sourceName, snapshots)
-                    .getBytes(StandardCharsets.UTF_8));
-                zip.closeEntry();
+                return 0;
             }
-        } catch (ArchiveWriteException exception) {
-            Files.deleteIfExists(temporary);
-            throw exception.cause;
-        } catch (IOException | RuntimeException exception) {
-            Files.deleteIfExists(temporary);
-            throw exception;
         }
 
         try {
-            Files.move(temporary, archive, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (java.nio.file.AtomicMoveNotSupportedException exception) {
-            Files.move(temporary, archive, StandardCopyOption.REPLACE_EXISTING);
+            Plan plan = buildPlan(server, target, source, options);
+            Session session = new Session();
+            session.transferId = plan.transferId;
+            session.targetUuid = target.getUUID();
+            session.targetName = target.getGameProfile().name();
+            session.plan = plan;
+            session.indexBytes = plan.index.encode();
+            SESSIONS.put(session.transferId, session);
+
+            if (source != null) {
+                source.sendSystemMessage(Component.literal("Offering the world to " + session.targetName
+                    + " (" + TransferData.humanBytes(plan.index.totalBytes())
+                    + " in total). Waiting for them to accept."));
+            }
+            LOGGER.info("Direct transfer {} offered to {}", session.transferId, session.targetName);
+            return 1;
+        } catch (IOException | RuntimeException exception) {
+            LOGGER.warn("Direct transfer could not start", exception);
+            if (source != null) {
+                source.sendSystemMessage(Component.literal("World transfer failed: " + exception.getMessage()));
+            }
+            return 0;
         }
-        return archive;
     }
 
-    /**
-     * The one change that actually moves the host role: Data.singleplayer_uuid.
-     */
-    private static CompoundTag newHostLevelData(Path worldRoot, UUID targetUuid) throws IOException {
-        CompoundTag level = NbtIo.readCompressed(worldRoot.resolve("level.dat"), NbtAccounter.unlimitedHeap());
-        CompoundTag data = level.getCompoundOrEmpty("Data");
-        data.putIntArray("singleplayer_uuid", UUIDUtil.uuidToIntArray(targetUuid));
-        data.remove("Player"); // legacy pre-1.21 host slot; never read today, but it must not linger
-        level.put("Data", data);
-        return level;
-    }
-
-    /**
-     * Player files are written without the UUID tag. Entity.load() would otherwise overwrite the joining
-     * player's UUID with the one from the old session, which is exactly how identities get swapped.
-     */
-    private static CompoundTag strippedPlayerData(CompoundTag source) {
-        CompoundTag copy = source.copy();
-        copy.remove("UUID");
-        return copy;
-    }
-
-    private static CompoundTag serializePlayer(MinecraftServer server, ServerPlayer player) {
-        TagValueOutput output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, server.registryAccess());
-        player.saveWithoutId(output); // same call vanilla PlayerDataStorage.save uses
-        return output.buildResult();
-    }
-
-    private static boolean isLivePlayerFile(String entryName, Set<UUID> uuids) {
-        if (!entryName.startsWith("playerdata/") || !entryName.endsWith(".dat")) {
-            return false;
+    private static void handleReply(MinecraftServer server, ServerPlayer player, TransferNet.Reply reply) {
+        Session session = SESSIONS.get(reply.transferId());
+        if (session == null || !session.targetUuid.equals(player.getUUID())) {
+            return;
         }
-        String stem = entryName.substring("playerdata/".length(), entryName.length() - ".dat".length());
-        for (UUID uuid : uuids) {
-            if (stem.equalsIgnoreCase(uuid.toString())) {
-                return true;
+        switch (reply.action()) {
+            case TransferNet.ACCEPT -> {
+                session.state = "collect";
+                LOGGER.info("Transfer {} accepted by {}", session.transferId, session.targetName);
+            }
+            case TransferNet.NEED -> {
+                session.needBuffer.writeBytes(reply.chunk());
+                if (reply.last()) {
+                    prepareBundle(server, session);
+                }
+            }
+            case TransferNet.DECLINE -> {
+                notifyHost(server, session, session.targetName + " declined the world transfer.");
+                finish(session, "declined");
+            }
+            case TransferNet.DONE -> {
+                notifyHost(server, session, session.targetName
+                    + " received the world and can open it from their singleplayer list.");
+                finish(session, "completed");
+            }
+            case TransferNet.FAILED -> {
+                notifyHost(server, session, "Transfer to " + session.targetName + " failed: " + reply.detail());
+                finish(session, "failed");
+            }
+            default -> {
             }
         }
-        return false;
     }
 
-    private static boolean shouldInclude(String path, boolean includePlayerData, boolean includeAdvancements,
-                                         boolean includeEntities, boolean includeWorldData) {
-        if (path.equals("session.lock") || path.equals("level.dat_old")) {
-            return false;
-        }
-        if (path.endsWith(".dat_old") || path.endsWith(".part")) {
-            return false;
-        }
-        // Artifacts of an earlier transfer must not travel with the world.
-        if (path.equals(MARKER_FILE) || path.startsWith(SNAPSHOT_DIR + "/")
-            || path.startsWith("world-transfer-")) {
-            return false;
-        }
-        if (!includePlayerData && (path.startsWith("playerdata/") || path.startsWith("data/command_storage"))) {
-            return false;
-        }
-        if (!includeAdvancements && path.startsWith("advancements/")) {
-            return false;
-        }
-        if (!includeEntities && path.startsWith("entities/")) {
-            return false;
-        }
-        if (!includeWorldData && path.startsWith("data/")) {
-            return false;
-        }
-        return true;
-    }
-
-    private static String markerJson(String targetName, UUID targetUuid, String sourceName,
-                                     Map<UUID, Snapshot> snapshots) {
-        StringBuilder participants = new StringBuilder();
-        for (Snapshot snapshot : snapshots.values()) {
-            if (participants.length() > 0) {
-                participants.append(", ");
+    private static void prepareBundle(MinecraftServer server, Session session) {
+        try {
+            String wanted = new String(TransferData.gunzip(session.needBuffer.toByteArray()),
+                StandardCharsets.UTF_8);
+            List<String> paths = new ArrayList<>();
+            for (String line : wanted.split("\n")) {
+                if (!line.isEmpty()) {
+                    paths.add(line);
+                }
             }
-            participants.append('"').append(escape(snapshot.name())).append('"');
+            session.bundle = Files.createTempFile("worldtransfer-", ".zip");
+            try (OutputStream output = Files.newOutputStream(session.bundle)) {
+                writeBundle(output, session.plan, paths, "");
+            }
+            session.bundleSize = Files.size(session.bundle);
+            session.bundleStream = Files.newInputStream(session.bundle);
+            session.outSeq = 0;
+            session.state = "sending";
+            notifyHost(server, session, "Sending " + TransferData.humanBytes(session.bundleSize)
+                + " to " + session.targetName + " (" + paths.size() + " files).");
+            LOGGER.info("Transfer {}: bundle of {} files, {} bytes",
+                session.transferId, paths.size(), session.bundleSize);
+        } catch (IOException | RuntimeException exception) {
+            LOGGER.warn("Could not build transfer bundle", exception);
+            notifyHost(server, session, "Could not build the transfer bundle: " + exception.getMessage());
+            finish(session, "bundle failed");
         }
-        return "{\n"
-            + "  \"format\": 5,\n"
-            + "  \"newHost\": \"" + escape(targetName) + "\",\n"
-            + "  \"newHostUuid\": \"" + targetUuid + "\",\n"
-            + "  \"previousHost\": \"" + escape(sourceName) + "\",\n"
-            + "  \"participants\": [" + participants + "]\n"
-            + "}\n";
+    }
+
+    private static void tickSessions(MinecraftServer server) {
+        if (SESSIONS.isEmpty()) {
+            return;
+        }
+        for (Session session : new ArrayList<>(SESSIONS.values())) {
+            ServerPlayer target = server.getPlayerList().getPlayer(session.targetUuid);
+            if (target == null) {
+                finish(session, "target left");
+                continue;
+            }
+            try {
+                if (session.state.equals("index")) {
+                    if (sendIndexChunk(target, session)) {
+                        session.state = "waiting";
+                    }
+                } else if (session.state.equals("sending")) {
+                    // Four 256 KiB packets per tick caps the stream at roughly 20 MB/s.
+                    for (int i = 0; i < 4 && session.state.equals("sending"); i++) {
+                        if (sendBundleChunk(target, session)) {
+                            session.state = "sent";
+                        }
+                    }
+                }
+            } catch (IOException | RuntimeException exception) {
+                LOGGER.warn("Transfer {} aborted", session.transferId, exception);
+                finish(session, "error");
+            }
+        }
+    }
+
+    private static boolean sendIndexChunk(ServerPlayer target, Session session) {
+        int remaining = session.indexBytes.length - session.indexOffset;
+        int size = Math.min(TransferNet.S2C_CHUNK, remaining);
+        byte[] chunk = Arrays.copyOfRange(session.indexBytes, session.indexOffset, session.indexOffset + size);
+        session.indexOffset += size;
+        boolean last = session.indexOffset >= session.indexBytes.length;
+        ServerPlayNetworking.send(target, new TransferNet.Blob(
+            session.transferId, TransferNet.STREAM_INDEX, session.outSeq++, last, chunk));
+        return last;
+    }
+
+    private static boolean sendBundleChunk(ServerPlayer target, Session session) throws IOException {
+        byte[] buffer = new byte[TransferNet.S2C_CHUNK];
+        int read = session.bundleStream.read(buffer);
+        if (read <= 0) {
+            ServerPlayNetworking.send(target, new TransferNet.Blob(
+                session.transferId, TransferNet.STREAM_BUNDLE, session.outSeq++, true, new byte[0]));
+            return true;
+        }
+        session.bundleSent += read;
+        boolean last = session.bundleSent >= session.bundleSize;
+        ServerPlayNetworking.send(target, new TransferNet.Blob(session.transferId, TransferNet.STREAM_BUNDLE,
+            session.outSeq++, last, read == buffer.length ? buffer : Arrays.copyOf(buffer, read)));
+        return last;
+    }
+
+    private static void notifyHost(MinecraftServer server, Session session, String message) {
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (server.isSingleplayerOwner(new NameAndId(player.getUUID(), player.getGameProfile().name()))) {
+                player.sendSystemMessage(Component.literal(message));
+            }
+        }
+        LOGGER.info("Transfer {}: {}", session.transferId, message);
+    }
+
+    private static void finish(Session session, String reason) {
+        SESSIONS.remove(session.transferId);
+        try {
+            if (session.bundleStream != null) {
+                session.bundleStream.close();
+            }
+            if (session.bundle != null) {
+                Files.deleteIfExists(session.bundle);
+            }
+        } catch (IOException ignored) {
+        }
+        LOGGER.info("Transfer {} ended: {}", session.transferId, reason);
     }
 
     // ------------------------------------------------------------------
-    // Import safety net
+    // Import safety net: the player's UUID changed between sessions
     // ------------------------------------------------------------------
 
-    /**
-     * Only does something when a player joins with no playerdata file of their own, which happens when their
-     * UUID differs between the two sessions (online host + offline clients, or the other way round). In that
-     * case their data is restored from the name-keyed snapshot instead of letting them spawn empty.
-     */
     private static void tickNameFallback(MinecraftServer server) {
         Path worldRoot = server.getWorldPath(LevelResource.ROOT);
-        Path marker = worldRoot.resolve(MARKER_FILE);
+        Path marker = worldRoot.resolve(TransferData.MARKER_FILE);
         if (!Files.isRegularFile(marker)) {
             return;
         }
-
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             SEEN_NAMES.add(player.getGameProfile().name().toLowerCase(Locale.ROOT));
             if (!FALLBACK_DONE.add(player.getUUID())) {
@@ -330,50 +555,39 @@ public class WorldTransfer implements ModInitializer {
                 if (Files.isRegularFile(worldRoot.resolve("playerdata").resolve(player.getUUID() + ".dat"))) {
                     continue; // vanilla already gave this player their own data
                 }
-                Path snapshot = worldRoot.resolve(SNAPSHOT_DIR).resolve("players")
-                    .resolve(sanitize(player.getGameProfile().name()).toLowerCase(Locale.ROOT) + ".dat");
+                Path snapshot = worldRoot.resolve(TransferData.PLAYERS_DIR)
+                    .resolve(TransferData.safeName(player.getGameProfile().name()) + ".dat");
                 if (!Files.isRegularFile(snapshot)) {
                     continue;
                 }
-                CompoundTag tag = strippedPlayerData(
-                    NbtIo.readCompressed(snapshot, NbtAccounter.unlimitedHeap()));
+                CompoundTag tag = stripUuid(NbtIo.readCompressed(snapshot, NbtAccounter.unlimitedHeap()));
                 player.load(TagValueInput.create(ProblemReporter.DISCARDING, server.registryAccess(), tag));
                 restorePosition(player, tag);
                 player.getInventory().setChanged();
                 player.inventoryMenu.broadcastChanges();
                 player.containerMenu.broadcastChanges();
                 player.sendSystemMessage(Component.literal(
-                    "World Transfer: your inventory and position were restored from the previous world."));
-                LOGGER.info("Restored {} from the name snapshot (UUID changed between sessions)",
-                    player.getGameProfile().name());
+                    "World Transfer: your data was restored from the previous world."));
             } catch (IOException | RuntimeException exception) {
-                LOGGER.warn("Could not restore {} from a name snapshot", player.getGameProfile().name(), exception);
+                LOGGER.warn("Name-based restore failed for {}", player.getGameProfile().name(), exception);
             }
         }
-
         try {
-            if (allParticipantsSeen(Files.readString(marker))) {
-                Files.deleteIfExists(marker); // transfer finished; stop arming the fallback
-                LOGGER.info("All transferred players have joined; transfer marker removed");
+            List<String> participants = TransferData.listField(Files.readString(marker), "participants");
+            if (!participants.isEmpty()) {
+                boolean allSeen = true;
+                for (String name : participants) {
+                    if (!SEEN_NAMES.contains(name.toLowerCase(Locale.ROOT))) {
+                        allSeen = false;
+                        break;
+                    }
+                }
+                if (allSeen) {
+                    Files.deleteIfExists(marker);
+                }
             }
         } catch (IOException ignored) {
         }
-    }
-
-    private static boolean allParticipantsSeen(String json) {
-        Matcher block = PARTICIPANT_NAMES.matcher(json);
-        if (!block.find()) {
-            return false;
-        }
-        Matcher names = QUOTED.matcher(block.group(1));
-        boolean any = false;
-        while (names.find()) {
-            any = true;
-            if (!SEEN_NAMES.contains(names.group(1).toLowerCase(Locale.ROOT))) {
-                return false;
-            }
-        }
-        return any;
     }
 
     private static void restorePosition(ServerPlayer player, CompoundTag snapshot) {
@@ -402,10 +616,91 @@ public class WorldTransfer implements ModInitializer {
     // Helpers
     // ------------------------------------------------------------------
 
-    private static void writeCompressedTag(ZipOutputStream zip, CompoundTag tag) throws IOException {
+    private static CompoundTag serializePlayer(MinecraftServer server, ServerPlayer player) {
+        TagValueOutput output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, server.registryAccess());
+        player.saveWithoutId(output); // the same call vanilla PlayerDataStorage.save uses
+        return output.buildResult();
+    }
+
+    /**
+     * Player files travel without their UUID tag: {@code Entity.load} would otherwise stamp the old
+     * session's UUID onto whoever loads the file, which is exactly how identities get swapped.
+     */
+    private static CompoundTag stripUuid(CompoundTag source) {
+        CompoundTag copy = source.copy();
+        copy.remove("UUID");
+        return copy;
+    }
+
+    private static byte[] toCompressedBytes(CompoundTag tag) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         NbtIo.writeCompressed(tag, bytes);
-        bytes.writeTo(zip);
+        return bytes.toByteArray();
+    }
+
+    private static String readOrCreateWorldId(Path worldRoot) throws IOException {
+        Path file = worldRoot.resolve(TransferData.WORLD_ID_FILE);
+        if (Files.isRegularFile(file)) {
+            String existing = Files.readString(file).trim();
+            if (!existing.isEmpty()) {
+                return existing;
+            }
+        }
+        String id = UUID.randomUUID().toString();
+        Files.createDirectories(file.getParent());
+        Files.writeString(file, id);
+        return id;
+    }
+
+    private static String appendHistory(Path worldRoot, String from, String to, String gameVersion,
+                                        String transferId) throws IOException {
+        Path file = worldRoot.resolve(TransferData.HISTORY_FILE);
+        List<TransferData.HistoryEntry> entries = Files.isRegularFile(file)
+            ? new ArrayList<>(TransferData.parseHistory(Files.readString(file)))
+            : new ArrayList<>();
+        entries.add(new TransferData.HistoryEntry(Instant.now().toString(), from, to, gameVersion, transferId));
+        return TransferData.writeHistory(entries);
+    }
+
+    private static boolean shouldInclude(String path, Options options) {
+        boolean includePlayerData = options.playerData();
+        boolean includeAdvancements = options.advancements();
+        boolean includeEntities = options.entities();
+        boolean includeWorldData = options.worldData();
+        if (path.equals("session.lock") || path.equals("level.dat_old")) {
+            return false;
+        }
+        if (path.endsWith(".dat_old") || path.endsWith(".part")) {
+            return false;
+        }
+        if (path.startsWith("world-transfer-")) {
+            return false; // artifacts of older mod versions
+        }
+        if (!options.carryCheats() && (path.equals("ops.json") || path.equals("whitelist.json")
+            || path.equals("banned-players.json") || path.equals("banned-ips.json"))) {
+            return false; // only present in server-style world folders, but never carried silently
+        }
+        if (!includePlayerData && (path.startsWith("playerdata/") || path.startsWith("data/command_storage"))) {
+            return false;
+        }
+        if (!includeAdvancements && path.startsWith("advancements/")) {
+            return false;
+        }
+        if (!includeEntities && path.startsWith("entities/")) {
+            return false;
+        }
+        if (!includeWorldData && path.startsWith("data/")) {
+            return false;
+        }
+        return true;
+    }
+
+    private static void moveInto(Path temporary, Path archive) throws IOException {
+        try {
+            Files.move(temporary, archive, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (java.nio.file.AtomicMoveNotSupportedException exception) {
+            Files.move(temporary, archive, StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
     private static Path findExportDirectory(Path worldRoot, String choice) {
@@ -419,22 +714,5 @@ public class WorldTransfer implements ModInitializer {
         }
         Path minecraftFolder = worldRoot.getParent() == null ? worldRoot : worldRoot.getParent().getParent();
         return minecraftFolder == null ? worldRoot : minecraftFolder;
-    }
-
-    private static String sanitize(String value) {
-        String safe = value.replaceAll("[^a-zA-Z0-9._-]", "_");
-        return safe.isEmpty() ? "world" : safe;
-    }
-
-    private static String escape(String value) {
-        return value.replace("\\", "\\\\").replace("\"", "\\\"");
-    }
-
-    private static final class ArchiveWriteException extends RuntimeException {
-        private final IOException cause;
-
-        private ArchiveWriteException(IOException cause) {
-            this.cause = cause;
-        }
     }
 }
