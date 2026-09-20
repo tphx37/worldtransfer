@@ -1,6 +1,6 @@
 # World Transfer (LAN Host Handoff)
 
-A Fabric mod for Minecraft 26.3 that hands a LAN world to a different player,
+A Fabric and NeoForge mod for Minecraft 26.3 that hands a LAN world to a different player,
 with everyone's inventory, position, and stats without it getting mixed up in the
 process.
 
@@ -10,15 +10,18 @@ your XP, your position. World Transfer instead hands ownership to the
 recipient while they keep being themselves, and everyone else who rejoins
 keeps being themselves too.
 
+
+
 ## Usage
 
-Requirements: Minecraft 26.3+, Fabric Loader 0.19.5+, and Fabric API. 
+Requirements: Minecraft 26.3+, either Fabric Loader 0.19.5+ with Fabric API or
+NeoForge 26.3.0.7-beta, and Java 25+.
 
 The mod only needs to be on the client that's currently hosting and on 
 whoever's about to become the new host, but since anyone might get chosen, 
 **it's simplest to just have it on every client.**
 
-1. Host a LAN world with the mod (and Fabric API) installed.
+1. Host a LAN world with the mod (and Fabric API or NeoForge) installed.
 2. Open the pause menu and click the **WT** button next to *Save and
    Quit*.
 3. Pick a connected player from the list, then choose how to hand it over:
@@ -46,14 +49,15 @@ copy that gets sent or zipped.
 
 - **Direct send**: an "Incoming world transfer" prompt pops up automatically
   with Accept/Decline. If you're mid-transfer already, or just want to check
-  on it again, it's also listed inside the same **WT** menu now, alongside
+  on it again, it's also listed inside the same **WT** menu, alongside
   the outgoing options.
 - **ZIP**: unzip it into `saves` and open it from the singleplayer list like
   any other world.
-- Either way, opening the transferred world for the first time shows a
-  message naming who handed it over to you and when - or a warning if the
-  save doesn't actually name you as the intended recipient, which usually
-  means the wrong ZIP got passed around.
+
+Either way, opening the transferred world for the first time shows a
+message naming who handed it over to you and when - or a warning if the
+save doesn't actually name you as the intended recipient, which usually
+means the wrong ZIP got passed around.
 
 ## Advanced settings
 
@@ -89,9 +93,11 @@ the save through every hand-off. It's viewable from the same **WT** menu.
   only helps if the player's *name* is unchanged. It won't help two
   different real people who happen to share a name.
 - **No resume for an interrupted direct send.** If the connection drops
-  mid-transfer, it has to be started over.
-- **No conflict handling for simultaneous transfers.** The mod assumes one
-  transfer completes before another is started from the same world.
+  mid-transfer, it has to be started over. But an interrupted or failed
+  apply does not corrupt an existing incremental copy.
+- **One direct transfer at a time.** The sender rejects a second direct
+  transfer until the first one completes, avoiding competing snapshots and
+  overlapping writes to the same receive slot.
 - **No block-level diffs.** Incremental sync compares whole files (so a
   changed region file re-sends in full, not just the changed chunks inside
   it).
@@ -100,10 +106,15 @@ the save through every hand-off. It's viewable from the same **WT** menu.
 
 ## Partially developed but not working
 
-- **Automatic reconnect** - having the old host's client automatically
+- **~~Automatic reconnect~~** - having the old host's client automatically
   rejoin the new host's LAN game once the transfer finishes, instead of
   needing to rediscover it manually.
-- **Signed markers**, to verify a ZIP's provenance beyond just trusting the marker inside it.
+- **~~Signed markers~~**, to verify a ZIP's provenance beyond just trusting the marker inside it.
+
+Automatic reconnect and signed markers remain intentionally disabled. Minecraft
+does not expose the new host's LAN address to the old host after handoff, and a
+signature needs a key trusted out-of-band. Embedding a key in the ZIP would only
+allow an attacker to replace both the marker and its key, meaning that the current marker is not an authenticity guarantee.
 
 ## Other
 <details>
@@ -126,15 +137,30 @@ the save through every hand-off. It's viewable from the same **WT** menu.
 
 ## Building from source
 
-Requires Java 25+, Fabric Loader 0.19.5+, and Fabric API, on Minecraft 26.3+.
+The project is split into three Gradle modules:
+
+- `common` contains loader-independent file indexing, hashing, marker,
+  ownership-history, and network-payload definitions.
+- `fabric` contains the Fabric initializer, Fabric API networking and lifecycle
+  registrations, client screens, and Fabric-only mixins.
+- `neoforge` contains the NeoForge `@Mod` constructor, event-listener boundary,
+  shared-payload registration, capability-registration boundary, metadata, and
+  the NeoForge implementation surface. NeoForge-specific lifecycle, command,
+  payload, client-event, and capability registration lives there without
+  changing `common`. Both loader artifacts now use the same transfer engine,
+  incremental receiver, payload definitions, screens, ZIP export, and ownership
+  handling.
+
+Build both loader targets from the repository root:
 
 ```powershell
 ./gradlew.bat build
 ```
 
-The compiled jar lands in `build/libs/world-transfer-<version>.jar`. Drop it
-in the `mods/` folder of every instance that will take part in a transfer,
-as explained in Usage step 0 above.
+The loader jars are written to `fabric/build/libs/` and
+`neoforge/build/libs/`. The shared library is written to `common/build/libs/`
+and is included as a project dependency by each loader module.
+
 
 ## License
 

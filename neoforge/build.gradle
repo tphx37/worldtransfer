@@ -1,0 +1,51 @@
+plugins {
+	id 'net.neoforged.moddev' version "${moddev_version}"
+}
+
+base {
+	archivesName = 'world-transfer-neoforge'
+}
+
+neoForge {
+	version = neoforge_version
+
+	runs {
+		client {
+			client()
+		}
+		server {
+			server()
+		}
+	}
+
+	mods {
+		worldtransfer {
+			sourceSet sourceSets.main
+		}
+	}
+}
+
+dependencies {
+	implementation project(':common')
+}
+tasks.named('jar') {
+	dependsOn project(':common').tasks.named('classes')
+	from project(':common').sourceSets.main.output
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 25
+}
+
+java {
+	withSourcesJar()
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+processResources {
+	inputs.property 'version', project.version
+	filesMatching('META-INF/neoforge.mods.toml') {
+		expand 'version': project.version
+	}
+}

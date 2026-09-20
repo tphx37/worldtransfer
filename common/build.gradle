@@ -1,0 +1,21 @@
+plugins {
+	id 'net.neoforged.moddev' version "${moddev_version}"
+}
+
+base {
+	archivesName = 'world-tranfer-common'
+}
+
+neoForge {
+	neoFormVersion = neoform_version
+}
+
+java {
+	withSourcesJar()
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 25
+}
