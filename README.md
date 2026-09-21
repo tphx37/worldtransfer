@@ -1,4 +1,11 @@
+
+
+
+
 # World Transfer (LAN Host Handoff)
+
+
+
 
 A Fabric and NeoForge mod for Minecraft 26.3 that hands a LAN world to a different player,
 with everyone's inventory, position, and stats without it getting mixed up in the
@@ -10,7 +17,12 @@ your XP, your position. World Transfer instead hands ownership to the
 recipient while they keep being themselves, and everyone else who rejoins
 keeps being themselves too.
 
+<details>
+  <summary><i>A video demonstration on how it works </i></summary>
+  <br>
+   <video src="https://github.com/user-attachments/assets/6c4e58da-997d-4f2b-96c8-ac4a80c09252" autoplay loop muted playsinline controls width="100%"></video>
 
+</details>
 
 ## Usage
 
